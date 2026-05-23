@@ -32,7 +32,7 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 from sklearn.preprocessing import MinMaxScaler
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'Source Code'))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Source Code'))
 from utils import calculate_nilm_metrics, save_model
 
 
