@@ -37,11 +37,14 @@ def load_redd_splits():
         val_data = pickle.load(f)[0]
     with open('data/redd/test_small.pkl', 'rb') as f:
         test_list = pickle.load(f)
-    test_data = pd.concat(test_list, ignore_index=True)
+    test_df = test_list[3]
+    test_data = test_df[
+        pd.DatetimeIndex(test_df.index).date == pd.Timestamp('2011-04-30').date()
+    ].reset_index(drop=True)
 
     print(f"Train data shape: {train_data.shape}")
     print(f"Validation data shape: {val_data.shape}")
-    print(f"Test data shape:  {test_data.shape}  ({len(test_list)} houses concatenated)")
+    print(f"Test data shape:  {test_data.shape}  (House 3, 2011-04-30)")
     print(f"Available columns: {list(train_data.columns)}")
 
     return {'train': train_data, 'val': val_data, 'test': test_data}

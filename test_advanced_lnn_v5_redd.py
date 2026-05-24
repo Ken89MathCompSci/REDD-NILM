@@ -167,14 +167,23 @@ class REDDDataset(torch.utils.data.Dataset):
 def load_redd_splits(dataset_dir):
     """Load train/val/test pkl files. Returns dict of DataFrames."""
     splits = {}
-    for name in ('train_small', 'val_small', 'test_small'):
+    for name in ('train_small', 'val_small'):
         path = os.path.join(dataset_dir, f'{name}.pkl')
         with open(path, 'rb') as f:
             data = pickle.load(f)
-        # Each pkl is a list of DataFrames; concatenate them
         df = pd.concat(data, ignore_index=True)
         splits[name] = df
         print(f"  {name:15s}: {len(df):7,} rows")
+    # Test: House 3 (index 3), day 2011-04-30
+    test_path = os.path.join(dataset_dir, 'test_small.pkl')
+    with open(test_path, 'rb') as f:
+        test_list = pickle.load(f)
+    test_df = test_list[3]
+    test_data = test_df[
+        pd.DatetimeIndex(test_df.index).date == pd.Timestamp('2011-04-30').date()
+    ].reset_index(drop=True)
+    splits['test_small'] = test_data
+    print(f"  {'test_small':15s}: {len(test_data):7,} rows  (House 3, 2011-04-30)")
     return splits
 
 
