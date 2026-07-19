@@ -1,17 +1,26 @@
 """
 combined_pinn_lnn_redd_dataset.py
 =============================================
-Dual-head PINN + Gated-Detection LNN for NILM -- REDD h5 splits.
+Dual-head PINN + Gated-Detection LNN for NILM -- REDD CSV splits.
 
 Companion to
 APR-scripts-UK-dale/combined_pinn_lnn_apr_new_house2_dataset.py, adapted to
-REDD's raw NILMTK HDF5 file (APR-new-REDD-dataset/redd.h5) instead of
-APR-new-House2-dataset/ CSVs or the old data/redd/*.pkl slices. See
-test_lnn_redd_dataset.py for the full data-source / column-mapping /
-building-choice notes shared by every script in this folder:
+REDD's exported CSVs (APR-new-REDD-dataset/REDD_{train,validation,test}.csv
+-- see export_apr_new_redd_dataset_csvs.py) instead of the raw redd.h5 file.
+See test_lnn_redd_dataset.py for the full data-source / column-mapping /
+building-choice notes shared by every script in this folder. train/val are
+single clean windows; REDD_test.csv holds TWO separate clean windows
+concatenated by row (real timestamps preserved, so there's a genuine
+~10-day gap in the timestamp column between them). _split_into_blocks()
+recovers those two blocks by detecting that gap, and they are windowed
+independently and concatenated only after windowing (never joined as raw
+timestamps -- see create_sequences_concat / the test-evaluation code in
+train()), since a single 2-day test block left dishwasher with too few ON
+events to evaluate reliably:
     Building 1, train 2011-04-18 -> 2011-04-28 (10 days)
              /  val   2011-04-30 -> 2011-05-03 ( 3 days)
-             /  test  2011-05-23 -> 2011-05-25 ( 2 days)
+             /  test  2011-05-11 -> 2011-05-13 ( 2 days)  +
+                      2011-05-23 -> 2011-05-25 ( 2 days)  = 4 days total
 
 Column mapping (REDD appliance type -> canonical name used here):
     fridge       -> fridge        (meter 5)
@@ -112,23 +121,10 @@ POS_WEIGHT_CLAMP  = (1.0, 50.0)
 APPLIANCES  = ['dishwasher', 'fridge', 'microwave', 'washing_machine']
 AGG_COL     = 'main'
 
-H5_FILENAME   = 'redd.h5'
-BUILDING      = 1
-RESAMPLE_FREQ = '3s'
-TIMEZONE      = 'US/Eastern'
-
-MAINS_METERS     = [1, 2]
-APPLIANCE_METERS = {
-    'dishwasher':      [6],
-    'fridge':          [5],
-    'microwave':       [11],
-    'washing_machine': [10, 20],
-}
-SPLIT_RANGES = {
-    'train': ('2011-04-18', '2011-04-28'),
-    'val':   ('2011-04-30', '2011-05-03'),
-    'test':  ('2011-05-23', '2011-05-25'),
-}
+TRAIN_CSV   = 'REDD_train.csv'
+VAL_CSV     = 'REDD_validation.csv'
+TEST_CSV    = 'REDD_test.csv'
+TEST_GAP_TOLERANCE = '10s'   # any bigger gap than this in REDD_test.csv marks a block boundary
 
 DEFAULT_DATASET_DIR = os.path.join(os.path.dirname(__file__), '..', 'APR-new-REDD-dataset')
 
@@ -204,45 +200,67 @@ def create_sequences(df: pd.DataFrame, stride: int):
     return np.array(X, dtype=np.float32), np.array(Y, dtype=np.float32)
 
 
+def create_sequences_concat(dfs: list, stride: int):
+    """Window each (non-adjacent) DataFrame independently, then concatenate
+    the resulting windows -- avoids fabricating a window that straddles the
+    gap between two separate test blocks. Returns the concatenated (X, Y)
+    plus the per-block window count and per-block row count, both needed to
+    split predictions back apart for per-block trace reconstruction."""
+    Xs, Ys, n_windows_per_block, n_rows_per_block = [], [], [], []
+    for df in dfs:
+        X, Y = create_sequences(df, stride)
+        Xs.append(X)
+        Ys.append(Y)
+        n_windows_per_block.append(len(X))
+        n_rows_per_block.append(len(df))
+    X_cat = np.concatenate(Xs, axis=0)
+    Y_cat = np.concatenate(Ys, axis=0)
+    return X_cat, Y_cat, n_windows_per_block, n_rows_per_block
+
+
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
 
-def _read_meter(h5_path, building, meter):
-    df = pd.read_hdf(h5_path, key=f'/building{building}/elec/meter{meter}/table')
-    ts = pd.to_datetime(df['index'], unit='ns', utc=True).dt.tz_convert(TIMEZONE)
-    return pd.Series(df['values_block_0'].values.astype(np.float32), index=pd.DatetimeIndex(ts))
+def _read_csv(path):
+    df = pd.read_csv(path, index_col='timestamp', parse_dates=True)
+    return df.rename(columns={'aggregate': 'main'})
 
 
-def _load_channel(h5_path, building, meters, target_index):
-    """Resample one or more meters onto target_index and sum them (handles
-    REDD's split-phase mains and washer_dryer's motor + heating-element
-    sub-meters)."""
-    total = pd.Series(0.0, index=target_index)
-    for m in meters:
-        s = _read_meter(h5_path, building, m)
-        r = s.resample(RESAMPLE_FREQ, origin=target_index[0]).mean().reindex(target_index)
-        total = total.add(r.fillna(0), fill_value=0)
-    return total
+def _split_into_blocks(df, gap_tolerance=TEST_GAP_TOLERANCE):
+    """Split a DataFrame into contiguous blocks wherever the timestamp index
+    jumps by more than gap_tolerance -- see test_lnn_redd_dataset.py."""
+    deltas = df.index.to_series().diff()
+    gap_td = pd.Timedelta(gap_tolerance)
+    split_points = np.where(deltas > gap_td)[0]
+    if len(split_points) == 0:
+        return [df]
+    blocks, start = [], 0
+    for sp in split_points:
+        blocks.append(df.iloc[start:sp])
+        start = sp
+    blocks.append(df.iloc[start:])
+    return blocks
 
 
-def load_data(dataset_dir: str, building: int = BUILDING) -> dict:
-    h5_path = os.path.join(dataset_dir, H5_FILENAME)
-    print(f"Loading REDD h5 data from '{h5_path}' (building {building}) ...")
+def load_data(dataset_dir: str) -> dict:
+    """train/val are single DataFrames; test is a LIST of DataFrames (two
+    separate clean windows recovered from REDD_test.csv -- see
+    _split_into_blocks) that must be windowed independently and concatenated
+    only after windowing (create_sequences_concat), never joined as raw
+    timestamps."""
+    print(f"Loading REDD CSV data from '{dataset_dir}' ...")
 
-    splits = {}
-    for name, (start, end) in SPLIT_RANGES.items():
-        target_index = pd.date_range(
-            start=pd.Timestamp(start, tz=TIMEZONE), end=pd.Timestamp(end, tz=TIMEZONE),
-            freq=RESAMPLE_FREQ, inclusive='left')
-        df = pd.DataFrame(index=target_index)
-        df['main'] = _load_channel(h5_path, building, MAINS_METERS, target_index)
-        for app, meters in APPLIANCE_METERS.items():
-            df[app] = _load_channel(h5_path, building, meters, target_index)
-        splits[name] = df
-        print(f"  {name:6s}: {len(df):>7,} rows")
-    print(f"  Columns: {list(splits['train'].columns)}")
-    return splits
+    train_df = _read_csv(os.path.join(dataset_dir, TRAIN_CSV))
+    val_df   = _read_csv(os.path.join(dataset_dir, VAL_CSV))
+    test_dfs = _split_into_blocks(_read_csv(os.path.join(dataset_dir, TEST_CSV)))
+
+    print(f"  train : {len(train_df):>7,} rows")
+    print(f"  val   : {len(val_df):>7,} rows")
+    for i, df in enumerate(test_dfs):
+        print(f"  test[{i}]: {len(df):>7,} rows")
+    print(f"  Columns: {list(train_df.columns)}")
+    return {'train': train_df, 'val': val_df, 'test': test_dfs}
 
 
 # ---------------------------------------------------------------------------
@@ -472,11 +490,11 @@ def train(data_dict: dict, save_dir: str,
 
     df_tr = data_dict['train']
     df_va = data_dict['val']
-    df_te = data_dict['test']
+    df_te_blocks = data_dict['test']   # list of DataFrames (two clean windows)
 
     tr_thr        = compute_adaptive_thresholds(df_tr)
     va_thr        = compute_adaptive_thresholds(df_va)
-    te_thr        = compute_adaptive_thresholds(df_te)
+    te_thr        = compute_adaptive_thresholds(pd.concat(df_te_blocks, ignore_index=True))
     tr_event_thr  = compute_event_thresholds(df_tr)
 
     print("  Eval thresholds (W):")
@@ -487,12 +505,12 @@ def train(data_dict: dict, save_dir: str,
     print("\nCreating sequences ...")
     X_tr, Y_tr = create_sequences(df_tr, STRIDE)
     X_va, Y_va = create_sequences(df_va, STRIDE)
-    X_te, Y_te = create_sequences(df_te, WIN)
+    X_te, Y_te, te_n_windows_per_block, te_n_rows_per_block = create_sequences_concat(df_te_blocks, WIN)
     n_feat = X_tr.shape[2]
-    n_tr, n_va, n_te = len(df_tr), len(df_va), len(df_te)
+    n_tr, n_va = len(df_tr), len(df_va)
     print(f"  Train : {X_tr.shape} -> {Y_tr.shape}  ({X_tr.shape[0]*WIN:,} predictions)")
     print(f"  Val   : {X_va.shape} -> {Y_va.shape}")
-    print(f"  Test  : {X_te.shape} -> {Y_te.shape}  [non-overlapping]")
+    print(f"  Test  : {X_te.shape} -> {Y_te.shape}  [non-overlapping, {len(df_te_blocks)} blocks]")
 
     # Feature scaling (Z-score per channel)
     feat_scalers = []
@@ -645,8 +663,21 @@ def train(data_dict: dict, save_dir: str,
                 te_preds.append(gated_power[b].cpu().numpy())
                 te_trues.append(yb[b].cpu().numpy())
 
-    pred_trace_te = reconstruct_trace(te_preds, n_te, WIN, WIN)
-    true_trace_te = reconstruct_trace(te_trues, n_te, WIN, WIN)
+    # Reconstruct each test block's trace separately (window predictions
+    # only tile correctly within their own block), then concatenate the
+    # raw true/pred traces -- concatenating post-reconstruction is safe
+    # since metrics are computed pointwise over the union of both blocks.
+    pred_traces, true_traces = [], []
+    idx = 0
+    for n_windows, n_rows in zip(te_n_windows_per_block, te_n_rows_per_block):
+        block_preds = te_preds[idx: idx + n_windows]
+        block_trues = te_trues[idx: idx + n_windows]
+        idx += n_windows
+        pred_traces.append(reconstruct_trace(block_preds, n_rows, WIN, WIN))
+        true_traces.append(reconstruct_trace(block_trues, n_rows, WIN, WIN))
+
+    pred_trace_te = np.concatenate(pred_traces, axis=0)
+    true_trace_te = np.concatenate(true_traces, axis=0)
     test_metrics  = per_app_metrics(true_trace_te, pred_trace_te, y_scalers, te_thr)
 
     print(f"\n{'Appliance':<18} {'F1':>7} {'Prec':>7} {'Rec':>7} "
@@ -667,7 +698,7 @@ def train(data_dict: dict, save_dir: str,
     _plot_metrics(history, test_metrics, save_dir)
 
     cfg = {
-        'dataset': 'REDD (APR-new-REDD-dataset/redd.h5, Building 1)',
+        'dataset': 'REDD (APR-new-REDD-dataset/REDD_*.csv, Building 1)',
         'model':   'CombinedPINNAdvancedLNN',
         'description': 'gated power = sigmoid(gate_logit) x sigmoid(power_logit)',
         'thresholds': {'train': tr_thr, 'val': va_thr, 'test': te_thr},
@@ -748,9 +779,10 @@ if __name__ == '__main__':
     parser.add_argument('--epsilon-w',    type=float, default=EPSILON_W)
     args = parser.parse_args()
 
-    h5_path = os.path.join(args.dataset_dir, H5_FILENAME)
-    if not os.path.exists(h5_path):
-        print(f"Error: {h5_path} not found."); sys.exit(1)
+    for fname in [TRAIN_CSV, VAL_CSV, TEST_CSV]:
+        p = os.path.join(args.dataset_dir, fname)
+        if not os.path.exists(p):
+            print(f"Error: {p} not found."); sys.exit(1)
 
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     save_dir  = os.path.join(

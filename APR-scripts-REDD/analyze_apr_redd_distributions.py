@@ -1,7 +1,8 @@
 """
-On-duration and time-of-day distribution analysis for REDD, read directly
-from the raw NILMTK HDF5 file (APR-new-REDD-dataset/redd.h5), broken down
-per split (train / validation / test).
+On-duration and time-of-day distribution analysis for REDD, read from the
+exported CSVs (APR-new-REDD-dataset/REDD_{train,validation,test}.csv -- see
+export_apr_new_redd_dataset_csvs.py), broken down per split (train /
+validation / test).
 
 Companion to APR-scripts-UK-dale/analyze_apr_new_house2_distributions.py --
 same purpose (ON-duration + time-of-day priors per appliance, per split),
@@ -16,22 +17,25 @@ per appliance:
     - Time-of-day distribution -- when during the day the device tends to be
       used/active.
 
-Dataset: Building 1 of APR-new-REDD-dataset/redd.h5 (has all four target
-appliances). Building 1's daily-gap profile has no long clean contiguous
-stretch anywhere close to UKDALE's -- REDD is a much shorter, gappier
-recording -- so splits here are three separate clean (low-gap) windows,
-chronologically ordered and non-overlapping:
+Dataset: Building 1 (has all four target appliances). Building 1's daily-gap
+profile has no long clean contiguous stretch anywhere close to UKDALE's --
+REDD is a much shorter, gappier recording. train/validation are single
+clean windows; REDD_test.csv holds TWO separate clean windows concatenated
+by row (real timestamps preserved, so there's a genuine ~10-day gap in the
+timestamp column between them) -- a single 2-day test block left dishwasher
+with too few ON events to evaluate reliably. Every split is processed as a
+list of one or more non-adjacent blocks (test's two blocks are recovered by
+detecting that gap -- see _split_into_blocks): ON-duration segments are
+extracted per block and the resulting duration arrays concatenated
+afterwards (never run-length-encoded across the raw concatenation, which
+would fabricate a segment spanning the gap between blocks); time-of-day
+fractions are safe to tally directly over the concatenated raw series,
+since hour-of-day grouping does not assume temporal adjacency. All windows
+are chronologically ordered and non-overlapping:
     train      : 2011-04-18 -> 2011-04-28  (10 days)
     validation : 2011-04-30 -> 2011-05-03  ( 3 days)
-    test       : 2011-05-23 -> 2011-05-25  ( 2 days)
-Mains is meter1 + meter2 (REDD's split-phase whole-house power);
-washer_dryer is meter10 + meter20 (motor + heating-element sub-meters).
-
-Column mapping (REDD appliance type -> canonical name used here):
-    fridge       -> fridge        (meter 5)
-    dish washer  -> dishwasher    (meter 6)
-    washer dryer -> washing_machine (meters 10 + 20)
-    microwave    -> microwave     (meter 11)
+    test       : 2011-05-11 -> 2011-05-13  ( 2 days)  +
+                 2011-05-23 -> 2011-05-25  ( 2 days)  = 4 days total
 
 Threshold choice: unlike UKDALE House 2 (which needed 20 W for fridge and
 30 W for microwave to avoid misreading standby/idle floors as ON), sweeping
@@ -57,11 +61,11 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-DATASET_DIR   = os.path.join(os.path.dirname(__file__), '..', 'APR-new-REDD-dataset')
-H5_FILENAME   = 'redd.h5'
-BUILDING      = 1
-RESAMPLE_FREQ = '3s'
-TIMEZONE      = 'US/Eastern'
+DATASET_DIR = os.path.join(os.path.dirname(__file__), '..', 'APR-new-REDD-dataset')
+TRAIN_CSV   = 'REDD_train.csv'
+VAL_CSV     = 'REDD_validation.csv'
+TEST_CSV    = 'REDD_test.csv'
+TEST_GAP_TOLERANCE = '10s'   # any bigger gap than this in REDD_test.csv marks a block boundary
 
 APPLIANCES   = ['dishwasher', 'fridge', 'microwave', 'washing_machine']
 THRESHOLD_W  = 10.0
@@ -70,55 +74,45 @@ SPLITS       = ['train', 'validation', 'test']
 SPLIT_COLORS = {'train': 'steelblue', 'validation': 'darkorange', 'test': 'seagreen'}
 STEP_SECONDS = 3.0
 
-MAINS_METERS     = [1, 2]
-APPLIANCE_METERS = {
-    'dishwasher':      [6],
-    'fridge':          [5],
-    'microwave':       [11],
-    'washing_machine': [10, 20],
-}
-SPLIT_RANGES = {
-    'train':      ('2011-04-18', '2011-04-28'),
-    'validation': ('2011-04-30', '2011-05-03'),
-    'test':       ('2011-05-23', '2011-05-25'),
-}
+
+def _read_csv(path):
+    df = pd.read_csv(path, index_col='timestamp', parse_dates=True)
+    return df.rename(columns={'aggregate': 'main'})
 
 
-def _read_meter(h5_path, building, meter):
-    df = pd.read_hdf(h5_path, key=f'/building{building}/elec/meter{meter}/table')
-    ts = pd.to_datetime(df['index'], unit='ns', utc=True).dt.tz_convert(TIMEZONE)
-    return pd.Series(df['values_block_0'].values.astype(np.float32), index=pd.DatetimeIndex(ts))
+def _split_into_blocks(df, gap_tolerance=TEST_GAP_TOLERANCE):
+    """Split a DataFrame into contiguous blocks wherever the timestamp index
+    jumps by more than gap_tolerance -- see test_lnn_redd_dataset.py."""
+    deltas = df.index.to_series().diff()
+    gap_td = pd.Timedelta(gap_tolerance)
+    split_points = np.where(deltas > gap_td)[0]
+    if len(split_points) == 0:
+        return [df]
+    blocks, start = [], 0
+    for sp in split_points:
+        blocks.append(df.iloc[start:sp])
+        start = sp
+    blocks.append(df.iloc[start:])
+    return blocks
 
 
-def _load_channel(h5_path, building, meters, target_index):
-    """Resample one or more meters onto target_index and sum them (handles
-    REDD's split-phase mains and washer_dryer's motor + heating-element
-    sub-meters)."""
-    total = pd.Series(0.0, index=target_index)
-    for m in meters:
-        s = _read_meter(h5_path, building, m)
-        r = s.resample(RESAMPLE_FREQ, origin=target_index[0]).mean().reindex(target_index)
-        total = total.add(r.fillna(0), fill_value=0)
-    return total
+def load_splits(dataset_dir=DATASET_DIR):
+    """Load train/validation/test, each as a LIST of one or more non-adjacent
+    DataFrame blocks (see module docstring) -- test has two (recovered from
+    REDD_test.csv via _split_into_blocks); train/validation have one each,
+    wrapped in a single-element list for a uniform interface."""
+    print(f"Loading REDD CSV data from '{dataset_dir}' ...")
 
-
-def load_splits(dataset_dir=DATASET_DIR, building=BUILDING):
-    """Load train/validation/test as separate DataFrames (see module docstring)."""
-    h5_path = os.path.join(dataset_dir, H5_FILENAME)
-    print(f"Loading REDD h5 data from '{h5_path}' (building {building}) ...")
-
-    dfs = {}
-    for name, (start, end) in SPLIT_RANGES.items():
-        target_index = pd.date_range(
-            start=pd.Timestamp(start, tz=TIMEZONE), end=pd.Timestamp(end, tz=TIMEZONE),
-            freq=RESAMPLE_FREQ, inclusive='left')
-        df = pd.DataFrame(index=target_index)
-        df['main'] = _load_channel(h5_path, building, MAINS_METERS, target_index)
-        for app, meters in APPLIANCE_METERS.items():
-            df[app] = _load_channel(h5_path, building, meters, target_index)
-        dfs[name] = df
-        n_days = len(df) * STEP_SECONDS / 86400
-        print(f"{name:<12} {len(df):,} rows  (~{n_days:.2f} days)")
+    dfs = {
+        'train':      [_read_csv(os.path.join(dataset_dir, TRAIN_CSV))],
+        'validation': [_read_csv(os.path.join(dataset_dir, VAL_CSV))],
+        'test':       _split_into_blocks(_read_csv(os.path.join(dataset_dir, TEST_CSV))),
+    }
+    for name, blocks in dfs.items():
+        for i, df in enumerate(blocks):
+            n_days = len(df) * STEP_SECONDS / 86400
+            label = name if len(blocks) == 1 else f'{name}[{i}]'
+            print(f"{label:<12} {len(df):,} rows  (~{n_days:.2f} days)")
     return dfs
 
 
@@ -159,6 +153,25 @@ def on_time_fraction_by_hour(series, threshold):
     return frac
 
 
+def extract_on_segments_multi(dfs, appliance, threshold):
+    """Run extract_on_segments on each (non-adjacent) block independently and
+    concatenate the results -- never run-length-encode across the raw
+    concatenation, which would fabricate a segment spanning the gap."""
+    durations_list, hours_list = [], []
+    for df in dfs:
+        d, h = extract_on_segments(df[appliance], threshold)
+        durations_list.append(d)
+        hours_list.append(h)
+    return np.concatenate(durations_list), np.concatenate(hours_list)
+
+
+def on_time_fraction_by_hour_multi(dfs, appliance, threshold):
+    """Hour-of-day tally is safe directly over the concatenated raw series
+    (it doesn't assume temporal adjacency between blocks)."""
+    combined = pd.concat([df[appliance] for df in dfs])
+    return on_time_fraction_by_hour(combined, threshold)
+
+
 def summarize(durations_min, span_hours):
     if len(durations_min) == 0:
         return {'count': 0, 'total_on_hours': 0.0, 'pct_of_span': 0.0}
@@ -176,14 +189,15 @@ def summarize(durations_min, span_hours):
     }
 
 
-def analyze_split(df, split_name):
-    span_hours = len(df) * STEP_SECONDS / 3600
+def analyze_split(dfs, split_name):
+    """dfs is a list of one or more non-adjacent DataFrame blocks."""
+    span_hours = sum(len(df) for df in dfs) * STEP_SECONDS / 3600
     results, summary = {}, {}
 
     for app in APPLIANCES:
         thr = THRESHOLDS[app]
-        durations_min, start_hours = extract_on_segments(df[app], thr)
-        hour_frac = on_time_fraction_by_hour(df[app], thr)
+        durations_min, start_hours = extract_on_segments_multi(dfs, app, thr)
+        hour_frac = on_time_fraction_by_hour_multi(dfs, app, thr)
         results[app] = {'durations_min': durations_min, 'hour_frac': hour_frac}
         summary[app] = summarize(durations_min, span_hours)
 

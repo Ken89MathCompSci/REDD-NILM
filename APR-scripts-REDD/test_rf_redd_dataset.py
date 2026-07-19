@@ -1,9 +1,9 @@
 """
-Random Forest baseline for NILM -- REDD h5 splits.
+Random Forest baseline for NILM -- REDD CSV splits.
 
 Companion to APR-scripts-UK-dale/test_rf_apr_new_house2_dataset.py, adapted
-to REDD's raw NILMTK HDF5 file (APR-new-REDD-dataset/redd.h5) instead of
-APR-new-House2-dataset/ CSVs or the old data/redd/*.pkl slices.
+to REDD's exported CSVs (APR-new-REDD-dataset/REDD_{train,validation,test}.csv
+-- see export_apr_new_redd_dataset_csvs.py) instead of the raw redd.h5 file.
 See test_lnn_redd_dataset.py for the full data-source / column-mapping /
 threshold notes shared by every script in this folder.
 
@@ -34,27 +34,14 @@ from sklearn.ensemble import RandomForestRegressor
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'Source Code'))
 from utils import calculate_nilm_metrics
 
-DATASET_DIR   = os.path.join(os.path.dirname(__file__), '..', 'APR-new-REDD-dataset')
-H5_FILENAME   = 'redd.h5'
-BUILDING      = 1
-RESAMPLE_FREQ = '3s'
-TIMEZONE      = 'US/Eastern'
+DATASET_DIR = os.path.join(os.path.dirname(__file__), '..', 'APR-new-REDD-dataset')
+TRAIN_CSV   = 'REDD_train.csv'
+VAL_CSV     = 'REDD_validation.csv'
+TEST_CSV    = 'REDD_test.csv'
+TEST_GAP_TOLERANCE = '10s'   # any bigger gap than this in REDD_test.csv marks a block boundary
 
 APPLIANCES  = ['dishwasher', 'fridge', 'microwave', 'washing_machine']
 THRESHOLD_W = 10.0
-
-MAINS_METERS     = [1, 2]
-APPLIANCE_METERS = {
-    'dishwasher':      [6],
-    'fridge':          [5],
-    'microwave':       [11],
-    'washing_machine': [10, 20],
-}
-SPLIT_RANGES = {
-    'train': ('2011-04-18', '2011-04-28'),
-    'val':   ('2011-04-30', '2011-05-03'),
-    'test':  ('2011-05-23', '2011-05-25'),
-}
 
 WIN    = 100
 STRIDE = 5
@@ -68,42 +55,48 @@ FEATURE_NAMES = ['mean', 'std', 'min', 'max', 'range', 'median',
                   'first', 'last', 'mean_abs_diff', 'max_abs_diff']
 
 
-def _read_meter(h5_path, building, meter):
-    df = pd.read_hdf(h5_path, key=f'/building{building}/elec/meter{meter}/table')
-    ts = pd.to_datetime(df['index'], unit='ns', utc=True).dt.tz_convert(TIMEZONE)
-    return pd.Series(df['values_block_0'].values.astype(np.float32), index=pd.DatetimeIndex(ts))
+def _read_csv(path):
+    df = pd.read_csv(path, index_col='timestamp', parse_dates=True)
+    return df.rename(columns={'aggregate': 'main'})
 
 
-def _load_channel(h5_path, building, meters, target_index):
-    """Resample one or more meters onto target_index and sum them (handles
-    REDD's split-phase mains and washer_dryer's motor + heating-element
-    sub-meters)."""
-    total = pd.Series(0.0, index=target_index)
-    for m in meters:
-        s = _read_meter(h5_path, building, m)
-        r = s.resample(RESAMPLE_FREQ, origin=target_index[0]).mean().reindex(target_index)
-        total = total.add(r.fillna(0), fill_value=0)
-    return total
+def _split_into_blocks(df, gap_tolerance=TEST_GAP_TOLERANCE):
+    """Split a DataFrame into contiguous blocks wherever the timestamp index
+    jumps by more than gap_tolerance -- see test_lnn_redd_dataset.py."""
+    deltas = df.index.to_series().diff()
+    gap_td = pd.Timedelta(gap_tolerance)
+    split_points = np.where(deltas > gap_td)[0]
+    if len(split_points) == 0:
+        return [df]
+    blocks, start = [], 0
+    for sp in split_points:
+        blocks.append(df.iloc[start:sp])
+        start = sp
+    blocks.append(df.iloc[start:])
+    return blocks
 
 
-def load_data(dataset_dir=DATASET_DIR, building=BUILDING):
-    """Load train / val / test from APR-new-REDD-dataset/redd.h5."""
-    h5_path = os.path.join(dataset_dir, H5_FILENAME)
-    print(f"Loading REDD h5 data from '{h5_path}' (building {building}) ...")
+def load_data(dataset_dir=DATASET_DIR):
+    """Load train / val / test from APR-new-REDD-dataset/REDD_*.csv.
 
-    splits = {}
-    for name, (start, end) in SPLIT_RANGES.items():
-        target_index = pd.date_range(
-            start=pd.Timestamp(start, tz=TIMEZONE), end=pd.Timestamp(end, tz=TIMEZONE),
-            freq=RESAMPLE_FREQ, inclusive='left')
-        df = pd.DataFrame(index=target_index)
-        df['main'] = _load_channel(h5_path, building, MAINS_METERS, target_index)
-        for app, meters in APPLIANCE_METERS.items():
-            df[app] = _load_channel(h5_path, building, meters, target_index)
-        splits[name] = df
-        print(f"  {name:6s}: {len(df):>7,} rows  {df.index.min()} -> {df.index.max()}")
+    train/val are single DataFrames; test is a LIST of DataFrames (two
+    separate clean windows recovered from REDD_test.csv -- see
+    _split_into_blocks) that must be windowed independently and concatenated
+    only after windowing (build_window_features_concat), never joined as raw
+    timestamps.
+    """
+    print(f"Loading REDD CSV data from '{dataset_dir}' ...")
 
-    return {'train': splits['train'], 'val': splits['val'], 'test': splits['test']}
+    train_df = _read_csv(os.path.join(dataset_dir, TRAIN_CSV))
+    val_df   = _read_csv(os.path.join(dataset_dir, VAL_CSV))
+    test_dfs = _split_into_blocks(_read_csv(os.path.join(dataset_dir, TEST_CSV)))
+
+    print(f"  train : {len(train_df):>7,} rows  {train_df.index.min()} -> {train_df.index.max()}")
+    print(f"  val   : {len(val_df):>7,} rows  {val_df.index.min()} -> {val_df.index.max()}")
+    for i, df in enumerate(test_dfs):
+        print(f"  test[{i}]: {len(df):>7,} rows  {df.index.min()} -> {df.index.max()}")
+
+    return {'train': train_df, 'val': val_df, 'test': test_dfs}
 
 
 def build_window_features(mains: np.ndarray, appliance_vals: np.ndarray,
@@ -137,6 +130,18 @@ def build_window_features(mains: np.ndarray, appliance_vals: np.ndarray,
     return feat, y_power
 
 
+def build_window_features_concat(dfs, appliance, win: int = WIN, stride: int = STRIDE):
+    """Build windowed features on each (non-adjacent) DataFrame independently,
+    then concatenate -- avoids fabricating a window that straddles the gap
+    between two separate test blocks."""
+    feats, ys = [], []
+    for df in dfs:
+        feat, y = build_window_features(df['main'].values, df[appliance].values, win, stride)
+        feats.append(feat)
+        ys.append(y)
+    return np.concatenate(feats, axis=0), np.concatenate(ys, axis=0)
+
+
 def train_rf_on_appliance(data_dict, appliance_name, save_dir):
     os.makedirs(save_dir, exist_ok=True)
 
@@ -147,7 +152,7 @@ def train_rf_on_appliance(data_dict, appliance_name, save_dir):
     print(f"\nBuilding windowed features for {appliance_name}...")
     X_tr, y_tr = build_window_features(train_data['main'].values, train_data[appliance_name].values)
     X_va, y_va = build_window_features(val_data['main'].values,   val_data[appliance_name].values)
-    X_te, y_te = build_window_features(test_data['main'].values,  test_data[appliance_name].values)
+    X_te, y_te = build_window_features_concat(test_data, appliance_name)
 
     on_tr = (y_tr > THRESHOLD_W).mean() * 100
     on_va = (y_va > THRESHOLD_W).mean() * 100
@@ -191,7 +196,7 @@ def train_rf_on_appliance(data_dict, appliance_name, save_dir):
 
     config = {
         'appliance': appliance_name,
-        'dataset': 'REDD (APR-new-REDD-dataset/redd.h5, Building 1)',
+        'dataset': 'REDD (APR-new-REDD-dataset/REDD_*.csv, Building 1)',
         'model': 'RandomForestRegressor',
         'threshold_w': THRESHOLD_W,
         'window_size': WIN,
@@ -235,7 +240,7 @@ def main():
         'dataset_splits': {
             'training':   'Building 1, 2011-04-18 -> 2011-04-28 (10 days)',
             'validation': 'Building 1, 2011-04-30 -> 2011-05-03 (3 days)',
-            'testing':    'Building 1, 2011-05-23 -> 2011-05-25 (2 days)',
+            'testing':    'Building 1, 2011-05-11->05-13 + 2011-05-23->05-25 (4 days, 2 blocks)',
         },
         'window_size': WIN, 'stride': STRIDE, 'threshold_w': THRESHOLD_W,
         'model_params': {
@@ -259,9 +264,10 @@ def main():
 
 
 if __name__ == "__main__":
-    h5_path = os.path.join(DATASET_DIR, H5_FILENAME)
-    if not os.path.exists(h5_path):
-        print(f"Error: {h5_path} not found!")
-        sys.exit(1)
+    for fname in [TRAIN_CSV, VAL_CSV, TEST_CSV]:
+        path = os.path.join(DATASET_DIR, fname)
+        if not os.path.exists(path):
+            print(f"Error: {path} not found!")
+            sys.exit(1)
 
     main()
